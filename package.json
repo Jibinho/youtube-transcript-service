@@ -1,0 +1,12 @@
+{
+  "name": "youtube-transcript-service",
+  "version": "1.0.0",
+  "description": "Service Netlify pour extraire les transcripts YouTube",
+  "main": "netlify/functions/get-transcript.js",
+  "scripts": {
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": ["youtube", "transcript", "netlify"],
+  "author": "",
+  "license": "MIT"
+}

@@ -25,7 +25,8 @@ async function fetchTranscript(videoId, lang = 'fr') {
       path: `/watch?v=${videoId}`,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9,fr;q=0.8'
       }
     };
 
@@ -38,26 +39,81 @@ async function fetchTranscript(videoId, lang = 'fr') {
       
       res.on('end', () => {
         try {
-          // Extraire les données de configuration de la page
-          const captionsMatch = data.match(/"captionTracks":(\[.*?\])/);
+          // Méthode 1 : Chercher captionTracks
+          let captionsMatch = data.match(/"captionTracks":\s*(\[.*?\])/);
+          
+          // Méthode 2 : Chercher dans playerCaptionsTracklistRenderer (plus robuste)
+          if (!captionsMatch) {
+            captionsMatch = data.match(/"playerCaptionsTracklistRenderer":\s*\{"captionTracks":\s*(\[.*?\])/);
+          }
+          
+          // Méthode 3 : Chercher avec une regex plus permissive
+          if (!captionsMatch) {
+            captionsMatch = data.match(/captionTracks["\s:]+(\[\{[^\]]+\}\])/);
+          }
           
           if (!captionsMatch) {
             reject(new Error('Aucun sous-titre disponible pour cette vidéo'));
             return;
           }
           
-          const captionTracks = JSON.parse(captionsMatch[1]);
+          let captionTracksStr = captionsMatch[1];
           
-          // Chercher le sous-titre dans la langue demandée, sinon prendre le premier disponible
-          let captionTrack = captionTracks.find(track => track.languageCode === lang);
-          if (!captionTrack) {
-            captionTrack = captionTracks.find(track => track.languageCode.startsWith(lang.split('-')[0]));
+          // Nettoyer la chaîne JSON (enlever les caractères d'échappement excessifs)
+          captionTracksStr = captionTracksStr.replace(/\\/g, '');
+          
+          let captionTracks;
+          try {
+            captionTracks = JSON.parse(captionTracksStr);
+          } catch (e) {
+            // Si le parsing échoue, essayer de nettoyer davantage
+            captionTracksStr = captionTracksStr
+              .replace(/,\s*}/g, '}')
+              .replace(/,\s*]/g, ']');
+            captionTracks = JSON.parse(captionTracksStr);
           }
+          
+          if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
+            reject(new Error('Aucun sous-titre disponible pour cette vidéo'));
+            return;
+          }
+          
+          // Chercher le sous-titre dans la langue demandée
+          let captionTrack = captionTracks.find(track => 
+            track.languageCode === lang || 
+            track.languageCode === lang.split('-')[0]
+          );
+          
+          // Si pas trouvé, chercher avec "vssId" qui indique souvent les sous-titres auto
           if (!captionTrack) {
-            captionTrack = captionTracks[0]; // Fallback sur le premier disponible
+            captionTrack = captionTracks.find(track => 
+              track.vssId && (
+                track.vssId.includes(`.${lang}`) || 
+                track.vssId.includes(`a.${lang}`)
+              )
+            );
+          }
+          
+          // Sinon prendre les sous-titres auto en anglais
+          if (!captionTrack) {
+            captionTrack = captionTracks.find(track => 
+              track.languageCode === 'en' || 
+              track.vssId?.includes('.en') ||
+              track.vssId?.includes('a.en')
+            );
+          }
+          
+          // En dernier recours, prendre le premier disponible
+          if (!captionTrack) {
+            captionTrack = captionTracks[0];
           }
           
           const captionUrl = captionTrack.baseUrl;
+          
+          if (!captionUrl) {
+            reject(new Error('URL des sous-titres introuvable'));
+            return;
+          }
           
           // Étape 2 : Récupérer le transcript XML
           https.get(captionUrl, (captionRes) => {
@@ -69,19 +125,22 @@ async function fetchTranscript(videoId, lang = 'fr') {
             
             captionRes.on('end', () => {
               // Parser le XML et extraire le texte avec timestamps
-              const textRegex = /<text start="([^"]+)" dur="([^"]+)"[^>]*>([^<]+)<\/text>/g;
+              const textRegex = /<text start="([^"]+)"[^>]*>([^<]+)<\/text>/g;
               const transcript = [];
               let match;
               
               while ((match = textRegex.exec(captionData)) !== null) {
                 const startTime = parseFloat(match[1]);
-                const text = match[3]
+                const text = match[2]
                   .replace(/&amp;/g, '&')
                   .replace(/&lt;/g, '<')
                   .replace(/&gt;/g, '>')
                   .replace(/&quot;/g, '"')
                   .replace(/&#39;/g, "'")
+                  .replace(/&apos;/g, "'")
                   .replace(/\n/g, ' ')
+                  .replace(/\r/g, ' ')
+                  .replace(/\s+/g, ' ')
                   .trim();
                 
                 if (text) {
@@ -90,6 +149,11 @@ async function fetchTranscript(videoId, lang = 'fr') {
                     text: text
                   });
                 }
+              }
+              
+              if (transcript.length === 0) {
+                reject(new Error('Impossible de parser les sous-titres'));
+                return;
               }
               
               resolve(transcript);
@@ -135,7 +199,7 @@ exports.handler = async (event) => {
       ? event.queryStringParameters 
       : JSON.parse(event.body || '{}');
     
-    const { url, videoId, lang = 'fr', format = 'detailed' } = params;
+    const { url, videoId, lang = 'en', format = 'detailed' } = params;
     
     // Extraire l'ID vidéo
     const id = videoId || extractVideoId(url);

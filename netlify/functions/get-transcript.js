@@ -1,5 +1,4 @@
 const https = require('https');
-const { URLSearchParams } = require('url');
 
 // Fonction pour extraire l'ID vidéo YouTube depuis différents formats d'URL
 function extractVideoId(url) {
@@ -16,8 +15,25 @@ function extractVideoId(url) {
   return null;
 }
 
+// Fonction pour décoder les entités HTML
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9A-Fa-f]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/\n/g, ' ')
+    .replace(/\r/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Fonction pour récupérer le transcript via l'API interne de YouTube
-async function fetchTranscript(videoId, lang = 'fr') {
+async function fetchTranscript(videoId, lang = 'en') {
   return new Promise((resolve, reject) => {
     // Étape 1 : Récupérer la page vidéo pour obtenir les métadonnées
     const options = {
@@ -25,8 +41,9 @@ async function fetchTranscript(videoId, lang = 'fr') {
       path: `/watch?v=${videoId}`,
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9,fr;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
     };
 
@@ -39,76 +56,66 @@ async function fetchTranscript(videoId, lang = 'fr') {
       
       res.on('end', () => {
         try {
-          // Méthode 1 : Chercher captionTracks
-          let captionsMatch = data.match(/"captionTracks":\s*(\[.*?\])/);
+          // Chercher ytInitialPlayerResponse qui contient toutes les données
+          const playerResponseMatch = data.match(/ytInitialPlayerResponse\s*=\s*({.+?});/);
           
-          // Méthode 2 : Chercher dans playerCaptionsTracklistRenderer (plus robuste)
-          if (!captionsMatch) {
-            captionsMatch = data.match(/"playerCaptionsTracklistRenderer":\s*\{"captionTracks":\s*(\[.*?\])/);
-          }
-          
-          // Méthode 3 : Chercher avec une regex plus permissive
-          if (!captionsMatch) {
-            captionsMatch = data.match(/captionTracks["\s:]+(\[\{[^\]]+\}\])/);
-          }
-          
-          if (!captionsMatch) {
-            reject(new Error('Aucun sous-titre disponible pour cette vidéo'));
+          if (!playerResponseMatch) {
+            reject(new Error('Impossible de trouver les données de la vidéo'));
             return;
           }
           
-          let captionTracksStr = captionsMatch[1];
-          
-          // Nettoyer la chaîne JSON (enlever les caractères d'échappement excessifs)
-          captionTracksStr = captionTracksStr.replace(/\\/g, '');
-          
-          let captionTracks;
+          let playerResponse;
           try {
-            captionTracks = JSON.parse(captionTracksStr);
+            playerResponse = JSON.parse(playerResponseMatch[1]);
           } catch (e) {
-            // Si le parsing échoue, essayer de nettoyer davantage
-            captionTracksStr = captionTracksStr
-              .replace(/,\s*}/g, '}')
-              .replace(/,\s*]/g, ']');
-            captionTracks = JSON.parse(captionTracksStr);
+            reject(new Error('Erreur de parsing des données vidéo'));
+            return;
           }
           
-          if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
+          // Extraire les captions
+          const captions = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+          
+          if (!captions || !Array.isArray(captions) || captions.length === 0) {
             reject(new Error('Aucun sous-titre disponible pour cette vidéo'));
             return;
           }
           
-          // Chercher le sous-titre dans la langue demandée
-          let captionTrack = captionTracks.find(track => 
-            track.languageCode === lang || 
-            track.languageCode === lang.split('-')[0]
-          );
+          // Stratégie de sélection des sous-titres
+          let selectedCaption = null;
           
-          // Si pas trouvé, chercher avec "vssId" qui indique souvent les sous-titres auto
-          if (!captionTrack) {
-            captionTrack = captionTracks.find(track => 
+          // 1. Chercher la langue exacte demandée
+          selectedCaption = captions.find(track => track.languageCode === lang);
+          
+          // 2. Chercher la langue de base (ex: 'fr' dans 'fr-FR')
+          if (!selectedCaption) {
+            const baseLang = lang.split('-')[0];
+            selectedCaption = captions.find(track => track.languageCode.startsWith(baseLang));
+          }
+          
+          // 3. Chercher dans vssId (identifiant des sous-titres auto)
+          if (!selectedCaption) {
+            selectedCaption = captions.find(track => 
               track.vssId && (
-                track.vssId.includes(`.${lang}`) || 
+                track.vssId.includes(`.${lang}`) ||
                 track.vssId.includes(`a.${lang}`)
               )
             );
           }
           
-          // Sinon prendre les sous-titres auto en anglais
-          if (!captionTrack) {
-            captionTrack = captionTracks.find(track => 
+          // 4. Si langue = fr et pas trouvé, essayer en
+          if (!selectedCaption && lang === 'fr') {
+            selectedCaption = captions.find(track => 
               track.languageCode === 'en' || 
-              track.vssId?.includes('.en') ||
-              track.vssId?.includes('a.en')
+              track.languageCode.startsWith('en')
             );
           }
           
-          // En dernier recours, prendre le premier disponible
-          if (!captionTrack) {
-            captionTrack = captionTracks[0];
+          // 5. Prendre le premier disponible en dernier recours
+          if (!selectedCaption) {
+            selectedCaption = captions[0];
           }
           
-          const captionUrl = captionTrack.baseUrl;
+          const captionUrl = selectedCaption.baseUrl;
           
           if (!captionUrl) {
             reject(new Error('URL des sous-titres introuvable'));
@@ -124,47 +131,49 @@ async function fetchTranscript(videoId, lang = 'fr') {
             });
             
             captionRes.on('end', () => {
-              // Parser le XML et extraire le texte avec timestamps
-              const textRegex = /<text start="([^"]+)"[^>]*>([^<]+)<\/text>/g;
-              const transcript = [];
-              let match;
-              
-              while ((match = textRegex.exec(captionData)) !== null) {
-                const startTime = parseFloat(match[1]);
-                const text = match[2]
-                  .replace(/&amp;/g, '&')
-                  .replace(/&lt;/g, '<')
-                  .replace(/&gt;/g, '>')
-                  .replace(/&quot;/g, '"')
-                  .replace(/&#39;/g, "'")
-                  .replace(/&apos;/g, "'")
-                  .replace(/\n/g, ' ')
-                  .replace(/\r/g, ' ')
-                  .replace(/\s+/g, ' ')
-                  .trim();
+              try {
+                // Parser le XML - Nouvelle approche plus robuste
+                const transcript = [];
                 
-                if (text) {
-                  transcript.push({
-                    start: startTime,
-                    text: text
-                  });
+                // Extraire tous les éléments <text>
+                const textMatches = captionData.matchAll(/<text[^>]*start="([^"]*)"[^>]*>(.*?)<\/text>/gs);
+                
+                for (const match of textMatches) {
+                  const startTime = parseFloat(match[1]);
+                  let text = match[2];
+                  
+                  // Décoder les entités HTML
+                  text = decodeHtmlEntities(text);
+                  
+                  if (text && text.length > 0) {
+                    transcript.push({
+                      start: startTime,
+                      text: text
+                    });
+                  }
                 }
+                
+                if (transcript.length === 0) {
+                  reject(new Error('Impossible de parser les sous-titres (0 entrées)'));
+                  return;
+                }
+                
+                resolve(transcript);
+              } catch (error) {
+                reject(new Error('Erreur lors du parsing XML: ' + error.message));
               }
-              
-              if (transcript.length === 0) {
-                reject(new Error('Impossible de parser les sous-titres'));
-                return;
-              }
-              
-              resolve(transcript);
             });
-          }).on('error', reject);
+          }).on('error', (error) => {
+            reject(new Error('Erreur lors du téléchargement des sous-titres: ' + error.message));
+          });
           
         } catch (error) {
-          reject(new Error('Erreur lors du parsing des sous-titres: ' + error.message));
+          reject(new Error('Erreur lors de l\'extraction des métadonnées: ' + error.message));
         }
       });
-    }).on('error', reject);
+    }).on('error', (error) => {
+      reject(new Error('Erreur de connexion YouTube: ' + error.message));
+    });
   });
 }
 
@@ -281,8 +290,7 @@ exports.handler = async (event) => {
       headers,
       body: JSON.stringify({ 
         error: 'Erreur lors de la récupération du transcript',
-        message: error.message,
-        details: error.stack
+        message: error.message
       })
     };
   }
